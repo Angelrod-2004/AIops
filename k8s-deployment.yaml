@@ -17,11 +17,12 @@ spec:
       containers:
         - name: streamlit-container
           image: streamlit-app:latest
+          imagePullPolicy: Never
           ports:
             - containerPort: 8501
           envFrom:
             - secretRef:
-                name: AIops-secrets
+                name: aiops-secrets
 ---
 apiVersion: v1
 kind: Service
