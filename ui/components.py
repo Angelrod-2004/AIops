@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, time, timedelta
 import json
 from pathlib import Path
@@ -62,6 +63,11 @@ def app_cards() -> None:
 # --------------------------------------------------------------------------- #
 # dynamic form
 # --------------------------------------------------------------------------- #
+def _with_value(field: Field, value: Any) -> Field:
+    """Return a copy of a field with its current value as the default."""
+    return replace(field, default=value)
+
+
 def render_field(field: Field, prefix: str) -> Any:
     key = f"{prefix}__{field.name}"
     label = f"{field.label} *" if field.required else field.label
