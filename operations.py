@@ -476,6 +476,30 @@ op("wa_phone_numbers", "whatsapp", "Phone numbers", "wa_list_phone_numbers", "Nu
 
 
 # --------------------------------------------------------------------------- #
+# form visibility
+# --------------------------------------------------------------------------- #
+# Fields that are deliberately not rendered in the front-end form. Each hidden
+# field is filled with a default at submit time (see HIDDEN_FIELD_DEFAULTS), so
+# the underlying tool still receives every parameter it expects.
+#
+# To put the Calendar picker back on screen, empty this set (and drop the entry
+# from HIDDEN_FIELD_DEFAULTS). Nothing else has to change.
+HIDDEN_FORM_FIELDS: frozenset[str] = frozenset({"calendar_id"})
+HIDDEN_FIELD_DEFAULTS: dict[str, Any] = {"calendar_id": "primary"}
+
+
+def visible_fields(operation: Operation) -> list[Field]:
+    """The fields the UI should render for an operation."""
+    return [f for f in operation.fields if f.name not in HIDDEN_FORM_FIELDS]
+
+
+def hidden_defaults(operation: Operation) -> dict[str, Any]:
+    """Values to inject for hidden fields the operation actually accepts."""
+    names = {f.name for f in operation.fields}
+    return {k: v for k, v in HIDDEN_FIELD_DEFAULTS.items() if k in names}
+
+
+# --------------------------------------------------------------------------- #
 # lookups
 # --------------------------------------------------------------------------- #
 OPERATION_INDEX: dict[str, Operation] = {o.id: o for o in OPERATIONS}

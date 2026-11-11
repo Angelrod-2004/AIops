@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime
+from typing import Any
 
 import streamlit as st
 
 import config
-from operations import OPS_BY_APP, OPERATIONS, groups_for
+from operations import OPS_BY_APP, OPERATIONS, get_operation, groups_for, hidden_defaults, visible_fields
 from ui.components import (
     APP_ORDER,
     app_cards,
@@ -24,8 +25,8 @@ from ui.components import (
     queue_row,
     render_field,
     report_panel,
-    result_card,
     validate,
+    _with_value,
 )
 from ui.theme import esc, footer, inject, pill, section
 
@@ -39,7 +40,7 @@ st.set_page_config(
 inject()
 
 try:
-    from agents.graph import run_chat, run_plan
+    from agents.graph import run_plan
 except Exception as exc:  # missing dependency or bad env
     st.error("Could not boot the agent runtime. Run `pip install -r requirements.txt` and reload.")
     st.exception(exc)
@@ -77,14 +78,6 @@ PRESETS: list[tuple[str, list[dict]]] = [
         {"app": "whatsapp", "operation_id": "wa_list_templates", "label": "List templates", "args": {"limit": 5}},
     ]),
 ]
-
-CHAT_SUGGESTIONS = [
-    "What's on my calendar tomorrow?",
-    "Email ada@example.com the Q4 summary and book 30 minutes with her tomorrow at 4pm",
-    "File a high priority bug in OPS called 'Checkout latency spike' and WhatsApp 919876543210 the new key",
-    "Move OPS-42 to In Progress and comment that I'm investigating",
-]
-
 
 # --------------------------------------------------------------------------- #
 # session
@@ -151,7 +144,76 @@ def now_label() -> str:
 
 def add_to_queue(tasks: list[dict]) -> None:
     for task in tasks:
-        st.session_state.queue.append({**task, "id": uuid.uuid4().hex[:8]})
+        st.session_state.queue.append({
+            **task,
+            "id": task.get("id") or uuid.uuid4().hex[:8],
+            "approved": bool(task.get("approved", False)),
+        })
+
+
+def pdf_intake() -> None:
+    """Upload a PDF, have the planner produce a reviewable queue, never execute it."""
+    section(
+        "PDF task intake",
+        "Upload a PDF of Gmail, Calendar, Jira or WhatsApp instructions. The agents turn it into concrete "
+        "actions — anything they are unsure about waits for your approval.",
+    )
+    upload = st.file_uploader("Instruction PDF", type=["pdf"], key="pdf_task_upload")
+    if not upload:
+        if st.session_state.get("pdf_notice"):
+            st.info(st.session_state.pop("pdf_notice"))
+        for warning in st.session_state.get("pdf_warnings") or []:
+            st.warning(warning, icon="⚠️")
+        st.session_state.pop("pdf_warnings", None)
+        return
+    st.caption(f"{upload.name} · {upload.size / 1024:.1f} KB · Planning never executes a task by itself.")
+
+    if st.button("Extract and plan PDF tasks", type="primary", key="plan_pdf_tasks"):
+        if not config.llm_configured():
+            st.error(
+                "PDF planning requires an LLM. Configure LLM_PROVIDER plus a key in .env "
+                "(GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY or GOOGLE_API_KEY)."
+            )
+            return
+        from agents.pdf_planner import plan_pdf_tasks
+
+        with st.status("Reading the PDF and planning actions…", expanded=True) as status:
+            try:
+                plan = plan_pdf_tasks(upload.getvalue(), upload.name)
+            except Exception as exc:
+                status.update(label="Could not plan this PDF", state="error")
+                st.error(str(exc))
+                return
+            tasks = plan["tasks"]
+            reviewed = 0
+            for task in tasks:
+                operation = get_operation(task.get("operation_id", ""))
+                # The planner decides when it is unsure. Independently force review
+                # whenever a required input is still blank - such a task cannot run.
+                missing = (
+                    validate(operation, task.get("args") or {}) if operation is not None else []
+                )
+                if missing:
+                    task["approval_required"] = True
+                    task["review_reason"] = task.get("review_reason") or (
+                        "Missing required input(s): " + ", ".join(
+                            field.label for field in (operation.required_fields if operation else [])
+                            if not str((task.get("args") or {}).get(field.name, "")).strip()
+                        )
+                    )
+                if task.get("approval_required"):
+                    reviewed += 1
+                task["approved"] = False
+            add_to_queue(tasks)
+            status.update(label=f"Prepared {len(tasks)} task(s)", state="complete")
+
+        st.session_state["pdf_notice"] = (
+            f"Read {plan['page_count']} page(s) in {plan['chunks']} part(s) and planned {len(tasks)} action(s). "
+            f"{reviewed} need your approval; the rest are ready to run."
+        )
+        if plan.get("failed_parts"):
+            st.session_state["pdf_warnings"] = plan["failed_parts"]
+        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +251,7 @@ def sidebar() -> None:
         else:
             st.markdown('<span class="nx-pill sim"><span class="nx-dot"></span>not configured</span>',
                         unsafe_allow_html=True)
-            st.caption("Command Deck works without a model. Add a key for chat mode.")
+            st.caption("Command Deck works without a model. A key enables PDF planning.")
 
         st.markdown('<div class="nx-side-title" style="margin-top:22px">Surface</div>', unsafe_allow_html=True)
         st.markdown(
@@ -340,13 +402,19 @@ def operation_builder() -> None:
         f'<div style="font-size:.86rem;color:#d6dbfb">{esc(operation.summary)}</div>'
         f'<div class="nx-mono" style="margin-top:6px">{esc(operation.app)} · {esc(operation.group)} · '
         f'<span style="color:#8ee7ff">{esc(operation.tool)}</span></div>'
-        + (f'<div class="nx-res-sub" style="margin-top:8px">Try: “{esc(operation.example)}” in Agent Chat</div>'
+        + ('<div class="nx-res-sub" style="margin-top:8px">Or describe it in a PDF above and let the agents plan it</div>'
            if operation.example else "")
         + "</div>",
         unsafe_allow_html=True,
     )
 
     values: dict = {}
+    hidden = hidden_defaults(operation)
+    if hidden:
+        st.caption(
+            "Runs against your **primary calendar**. "
+            f"(Hidden field: {', '.join(f'`{k}={v}`' for k, v in hidden.items())}.)"
+        )
     with st.form(key=f"form_{operation.id}", clear_on_submit=False, border=False):
         buffer: list = []
 
@@ -359,9 +427,7 @@ def operation_builder() -> None:
                     values[field.name] = render_field(field, operation.id)
             buffer.clear()
 
-        for field in operation.fields:
-            if field.name == "calendar_id":
-                continue
+        for field in visible_fields(operation):
             if field.kind in ("textarea", "json", "file", "datetime"):
                 flush()
                 values[field.name] = render_field(field, operation.id)
@@ -371,16 +437,14 @@ def operation_builder() -> None:
                     flush()
         flush()
 
-        if not operation.fields:
+        if not visible_fields(operation):
             st.caption("This operation needs no inputs.")
 
         submitted = st.form_submit_button("＋  Add to run queue", type="primary", use_container_width=True)
 
     if submitted:
-        # If operation expects calendar_id, provide default "primary"
-        for field in operation.fields:
-            if field.name == "calendar_id" and "calendar_id" not in values:
-                values["calendar_id"] = "primary"
+        # Hidden fields fall back to their documented default.
+        values.update(hidden_defaults(operation))
         problems = validate(operation, values)
         if problems:
             for problem in problems:
@@ -402,6 +466,7 @@ def operation_builder() -> None:
 
 def render_queue() -> None:
     queue = st.session_state.queue
+    pending_review = [task for task in queue if task.get("approval_required") and not task.get("approved")]
     st.markdown(
         f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">'
         f'<span class="nx-mono" style="letter-spacing:.24em;color:#c3c9ef">RUN QUEUE</span>'
@@ -414,9 +479,72 @@ def render_queue() -> None:
         for index, task in enumerate(queue):
             queue_row(task, index)
 
+    if pending_review:
+        st.warning(f"{len(pending_review)} task(s) need human approval and will not run yet.", icon="⚠️")
+        with st.expander("Human approval · review and edit pending tasks", expanded=True):
+            for task in pending_review:
+                operation = get_operation(task.get("operation_id", ""))
+                st.markdown(
+                    f"**{task.get('label', 'Task')}** · "
+                    f"{config.APP_META.get(task.get('app'), {}).get('label', task.get('app'))}"
+                )
+                st.caption(task.get("review_reason") or "Confirm or correct this action before it can run.")
+                source = task.get("source") or {}
+                if source.get("filename"):
+                    st.caption(
+                        f"From {source['filename']} · part {source.get('part', '?')} "
+                        f"of {source.get('page_count', '?')} page(s)"
+                    )
+
+                if operation is None:
+                    st.info("This task requires free-form agent execution. Approve only if its instruction is correct.")
+                    loaded = list(task.get("args") or {})
+                    if loaded:
+                        st.caption("Provided values: " + ", ".join(loaded))
+                    task["prompt"] = st.text_area(
+                        "Instruction", value=task.get("prompt", ""), key=f"review_prompt_{task['id']}"
+                    )
+                else:
+                    # Real inputs instead of raw JSON, so a non-technical reviewer can fix them.
+                    edited_args: dict[str, Any] = {}
+                    for field in operation.fields:
+                        hint = ""
+                        current = task.get("args", {}).get(field.name)
+                        if field.required and (current in (None, "")):
+                            hint = " ← required, currently blank"
+                        widget = render_field(
+                            _with_value(field, current), f"review_{task['id']}"
+                        )
+                        edited_args[field.name] = widget
+                        if hint:
+                            st.caption(f"**{field.label}**{hint}")
+                    task["args"] = {
+                        key: value for key, value in edited_args.items()
+                        if not (isinstance(value, str) and not value.strip())
+                    }
+                    problems = validate(operation, task["args"])
+                    if problems:
+                        st.error("Still missing before it can run: " + " ".join(problems))
+
+                approve, remove = st.columns(2)
+                blocked = operation is not None and bool(validate(operation, task.get("args") or {}))
+                if approve.button(
+                    "Approve task", key=f"approve_{task['id']}", type="primary",
+                    use_container_width=True, disabled=blocked,
+                    help="Fill the required fields first." if blocked else "Allow this task to run.",
+                ):
+                    task["approval_required"] = True
+                    task["approved"] = True
+                    st.rerun()
+                if remove.button("Remove task", key=f"review_remove_{task['id']}", use_container_width=True):
+                    st.session_state.queue = [item for item in st.session_state.queue if item["id"] != task["id"]]
+                    st.rerun()
+                st.divider()
+
     st.markdown("")
     run_col, clear_col = st.columns([1.6, 1])
-    if run_col.button("▶  Execute queue", type="primary", use_container_width=True, disabled=not queue):
+    executable = [task for task in queue if not task.get("approval_required") or task.get("approved")]
+    if run_col.button("▶  Execute approved queue", type="primary", use_container_width=True, disabled=not executable):
         execute_queue()
     if clear_col.button("Clear", use_container_width=True, disabled=not queue):
         st.session_state.queue = []
@@ -426,8 +554,13 @@ def render_queue() -> None:
 
 
 def execute_queue() -> None:
-    tasks = list(st.session_state.queue)
+    # Approval-gated tasks stay visible in the queue but cannot reach any tool.
+    tasks = [
+        task for task in st.session_state.queue
+        if not task.get("approval_required") or task.get("approved")
+    ]
     if not tasks:
+        st.warning("Approve at least one queued task before executing.")
         return
     with st.status(f"Dispatching {len(tasks)} task(s) to the agent grid…", expanded=True) as status:
         st.write("Supervisor → " + "  ·  ".join(
@@ -448,11 +581,14 @@ def execute_queue() -> None:
         "prompt": " · ".join(t["label"] for t in tasks),
         "state": state,
     })
-    st.session_state.queue = []
+    # Only drop what actually ran - tasks still awaiting approval stay queued.
+    ran_ids = {task.get("id") for task in tasks}
+    st.session_state.queue = [t for t in st.session_state.queue if t.get("id") not in ran_ids]
     st.rerun()
 
 
 def command_deck() -> None:
+    pdf_intake()
     section("Command deck", "Choose the app, pick the operation, fill the required fields (marked *).")
     preset_row()
 
@@ -468,70 +604,6 @@ def command_deck() -> None:
     if last:
         section("Execution report", "What the agents did, and the raw payload each tool returned.")
         report_panel(last)
-
-
-# --------------------------------------------------------------------------- #
-# chat
-# --------------------------------------------------------------------------- #
-def handle_chat(prompt: str) -> None:
-    st.session_state.chat.append({"role": "user", "content": prompt})
-    try:
-        state = run_chat(prompt)
-    except Exception as exc:
-        state = {"answer": f"Run failed: {exc}", "results": []}
-    st.session_state.chat.append({
-        "role": "assistant",
-        "content": state.get("answer") or "Done.",
-        "results": state.get("results") or [],
-    })
-    st.session_state.runs.insert(0, {
-        "ts": now_label(),
-        "mode": "chat",
-        "prompt": prompt,
-        "state": state,
-    })
-    st.rerun()
-
-
-def agent_chat() -> None:
-    section("Agent chat", "Describe the outcome — the supervisor plans, the specialists execute.")
-    if not config.llm_configured():
-        st.warning(
-            "Chat mode needs a model. Add `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GOOGLE_API_KEY` to `.env`, "
-            "then reload. The **Command Deck** tab already works without one.",
-            icon="⚠️",
-        )
-
-    if not st.session_state.chat:
-        st.markdown(
-            '<div class="nx-empty">Nothing here yet. Try one of the prompts below — each one fans out to one '
-            'or more specialist agents.</div>',
-            unsafe_allow_html=True,
-        )
-
-    for turn in st.session_state.chat:
-        with st.chat_message(turn["role"], avatar="🤖" if turn["role"] == "assistant" else "👤"):
-            st.markdown(turn["content"])
-            for result in turn.get("results") or []:
-                result_card(result)
-
-    st.markdown("")
-    columns = st.columns(2)
-    for index, suggestion in enumerate(CHAT_SUGGESTIONS):
-        if columns[index % 2].button(suggestion, key=f"sug_{index}", use_container_width=True):
-            handle_chat(suggestion)
-
-    with st.form("chat_composer", border=False, clear_on_submit=True):
-        prompt = st.text_area(
-            "Message",
-            placeholder="e.g. Book 30 minutes with ada@example.com tomorrow 4pm and WhatsApp her the link",
-            height=96,
-            label_visibility="collapsed",
-            key="chat_prompt",
-        )
-        if st.form_submit_button("⇥  Dispatch to the agent grid", type="primary", use_container_width=True):
-            if prompt and prompt.strip():
-                handle_chat(prompt.strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -573,14 +645,12 @@ missing_banner()
 section("Agent fleet", "Four specialists, each with its own toolbelt.")
 app_cards()
 
-tabs = st.tabs(["⚡ Command Deck", "🧠 Agent Chat", "🧾 Run Log", "📚 How it works"])
+tabs = st.tabs(["⚡ Command Deck", "🧾 Run Log", "📚 How it works"])
 with tabs[0]:
     command_deck()
 with tabs[1]:
-    agent_chat()
-with tabs[2]:
     run_log()
-with tabs[3]:
+with tabs[2]:
     how_it_works()
 
 footer()

@@ -99,6 +99,9 @@ LLM_PROVIDER: str = _env("LLM_PROVIDER", default="openai").lower()
 LLM_MODEL: str = _env("LLM_MODEL", default="")
 LLM_TEMPERATURE: float = float(_env("LLM_TEMPERATURE", default="0.2"))
 LLM_BASE_URL: str = _env("LLM_BASE_URL", "OPENAI_BASE_URL", default="")
+# Reply budget. Long PDFs produce long task plans, so this must be generous;
+# too small a value truncates the JSON mid-object.
+LLM_MAX_TOKENS: int = int(_env("LLM_MAX_TOKENS", default="8192"))
 OPENAI_API_KEY: str = _env("OPENAI_API_KEY", "LLM_API_KEY")
 ANTHROPIC_API_KEY: str = _env("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY: str = _env("GOOGLE_API_KEY", "GEMINI_API_KEY")
@@ -107,7 +110,9 @@ DEFAULT_MODELS: dict[str, str] = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-5-20250929",
     "google": "gemini-2.5-flash",
-    "groq": "llama-3.3-70b-versatile",
+    # Groq retired llama-3.3-70b-versatile; gpt-oss-120b is its current
+    # tool-calling flagship.
+    "groq": "openai/gpt-oss-120b",
     "ollama": "llama3.1",
 }
 

@@ -40,26 +40,128 @@ Catalogue of supported operations (app | operation_id | what it does | required 
 
 Split the user's request into one task per concrete action. Allowed task shapes:
 1. {{"app": "<one of gmail|calendar|jira|whatsapp>", "operation_id": "<id from the catalogue>",
-   "args": {{...exact parameter names from required args...}}, "label": "<short human label>"}}
-2. {{"app": "<app>", "operation_id": "auto", "prompt": "<full instruction>", "label": "<short label>"}}
+   "args": {{...exact parameter names from required args...}}, "label": "<short human label>",
+   "approval_required": true|false, "review_reason": "<why, if approval is required>"}}
+2. {{"app": "<app>", "operation_id": "auto", "prompt": "<full instruction>", "label": "<short label>",
+   "approval_required": true|false, "review_reason": "<why, if approval is required>"}}
    Use "auto" only when no catalogued operation fits.
 
 Rules:
-- Never invent operation ids. Never put a value in args that the user did not provide and you cannot infer.
+- Never invent operation ids. Use only supported argument names.
 - Use ISO-8601 datetimes in args, resolved against today's date.
+- Infer only safe, conventional defaults when the intent is clear: a meeting is 60 minutes, a webinar is 180 minutes, and a birthday email gets a warm concise body.
+- Mark `approval_required` true whenever an identity, recipient, date/time, destination, important content, or other detail remains ambiguous. State the uncertainty in `review_reason`; do not execute those tasks until approved.
+- Mark `approval_required` false only when the operation is fully specified or its missing values have an unambiguous conventional default.
 - If the request is a question about data (e.g. "what's on my calendar"), pick the matching read operation.
-- If something essential is missing, add it to "missing" instead of guessing.
+- If something essential is missing and cannot be sensibly inferred, add it to "missing" as well as requiring approval on the affected task.
 
 Return STRICT JSON only, no markdown:
 {{"tasks": [...], "missing": ["..."], "reply": "<one sentence describing the plan>"}}"""
 
 
+def _repair_json(text: str) -> str:
+    """Close a truncated JSON document and drop trailing commas."""
+    text = re.sub(r",(\s*[}\]])", r"\1", text)          # trailing commas
+    text = re.sub(r"//[^\n]*", "", text)                 # line comments
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)    # block comments
+    return _close_brackets(text)
+
+
+def _close_brackets(text: str) -> str:
+    """Append the closers needed to balance open brackets of a JSON document."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]" and stack:
+            stack.pop()
+    if in_string:
+        text += '"'
+    for opener in reversed(stack):
+        text += "}" if opener == "{" else "]"
+    return text
+
+
+def _salvage_truncated(text: str) -> dict[str, Any] | None:
+    """Recover a truncated task plan by keeping only complete task objects.
+
+    A reply cut off mid-key cannot be repaired (a bare key is invalid JSON), so
+    drop back to the last complete object and close the document there.
+    """
+    boundaries = [m.end() for m in re.finditer(r"\}", text)]
+    for cut in reversed(boundaries[-80:]):
+        candidate = _repair_json(text[:cut])
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _extract_json(text: str) -> dict[str, Any]:
-    cleaned = re.sub(r"```(?:json)?", "", text or "").strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("planner did not return JSON")
-    return json.loads(cleaned[start : end + 1])
+    """Pull one JSON object out of a model reply, tolerating fences and prose.
+
+    Long documents make models wrap the payload in explanation, emit several
+    objects, or stop mid-way, so a naive first-`{`/last-`}` slice is not enough.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("planner returned no output")
+    cleaned = re.sub(r"```(?:json|JSON)?", "", cleaned).strip()
+
+    try:
+        whole = json.loads(cleaned)
+        if isinstance(whole, dict):
+            return whole
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", cleaned):
+        try:
+            value, _ = decoder.raw_decode(cleaned[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and ("tasks" in value or "reply" in value or "missing" in value):
+            return value
+
+    for match in re.finditer(r"\{", cleaned):
+        candidate = _repair_json(cleaned[match.start():])
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            # Parsed only after repair: the reply was imperfect (truncated,
+            # trailing comma, comments...). Flag it so callers can warn.
+            value["recovered"] = True
+            return value
+
+    salvaged = _salvage_truncated(cleaned)
+    if salvaged is not None:
+        recovered = salvaged.get("tasks")
+        if isinstance(recovered, list) and recovered:
+            salvaged["recovered"] = True
+            return salvaged
+
+    raise ValueError(
+        "The model did not return usable JSON. Try again, shorten the document, "
+        "or switch to a stronger model in .env (LLM_MODEL)."
+    )
 
 
 def tasks_from_payload(payload: dict[str, Any], prompt: str) -> tuple[list[dict[str, Any]], str]:
@@ -87,6 +189,8 @@ def tasks_from_payload(payload: dict[str, Any], prompt: str) -> tuple[list[dict[
                 "args": raw.get("args") if isinstance(raw.get("args"), dict) else {},
                 "label": raw.get("label") or (operation.name if operation else f"{app} task"),
                 "prompt": raw.get("prompt") or prompt,
+                "approval_required": bool(raw.get("approval_required", False)),
+                "review_reason": str(raw.get("review_reason") or "").strip(),
             }
         )
 
@@ -99,7 +203,8 @@ def tasks_from_payload(payload: dict[str, Any], prompt: str) -> tuple[list[dict[
     return tasks, note
 
 
-def _planner_tasks(prompt: str) -> tuple[list[dict[str, Any]], str]:
+def _planner_tasks_from_text(prompt: str) -> dict[str, Any]:
+    """Ask the supervisor for a validated-plan JSON payload without executing it."""
     llm = build_llm(temperature=0)
     system = PLANNER_PROMPT.format(
         today=datetime.now().strftime("%A %d %B %Y"), tz=config.DEFAULT_TIMEZONE, catalogue=_catalog()
@@ -108,7 +213,11 @@ def _planner_tasks(prompt: str) -> tuple[list[dict[str, Any]], str]:
 
     reply = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
     content = reply.content if isinstance(reply.content, str) else json.dumps(reply.content, default=str)
-    return tasks_from_payload(_extract_json(content), prompt)
+    return _extract_json(content)
+
+
+def _planner_tasks(prompt: str) -> tuple[list[dict[str, Any]], str]:
+    return tasks_from_payload(_planner_tasks_from_text(prompt), prompt)
 
 
 def supervisor_node(state: GraphState) -> dict[str, Any]:

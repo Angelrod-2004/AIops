@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-from operations import OPS_BY_APP  # noqa: E402
+from operations import OPS_BY_APP, HIDDEN_FORM_FIELDS, hidden_defaults  # noqa: E402
 
 WIDGET_ATTRS = (
     "text_input", "text_area", "number_input", "selectbox", "toggle", "multiselect",
@@ -54,6 +54,7 @@ def main() -> int:
     problems: list[str] = []
     checked_ops = 0
     checked_fields = 0
+    hidden_ok = 0
 
     for app, operations in OPS_BY_APP.items():
         pick = next((b for b in at.button if b.key == f"pick_{app}"), None)
@@ -81,13 +82,24 @@ def main() -> int:
             checked_ops += 1
             keys = widget_keys(at)
             for field in operation.fields:
-                checked_fields += 1
                 base = f"{operation.id}__{field.name}"
                 rendered = any(k == base or k.startswith(f"{base}__") for k in keys)
-                if not rendered:
-                    problems.append(f"{operation.id}: field '{field.name}' ({field.kind}) rendered no widget")
+                if rendered:
+                    checked_fields += 1
+                    continue
+                if field.name in HIDDEN_FORM_FIELDS:
+                    # Deliberately hidden: it must still get a default at submit.
+                    if field.name in hidden_defaults(operation):
+                        hidden_ok += 1
+                        continue
+                    problems.append(
+                        f"{operation.id}: field '{field.name}' is hidden but has no default"
+                    )
+                    continue
+                problems.append(f"{operation.id}: field '{field.name}' ({field.kind}) rendered no widget")
 
-    print(f"checked {checked_ops} operations · {checked_fields} fields")
+    print(f"checked {checked_ops} operations · {checked_fields} rendered fields · "
+          f"{hidden_ok} deliberately hidden (defaulted)")
     if problems:
         print(f"\n{len(problems)} problem(s):")
         for problem in problems:

@@ -7,3 +7,5 @@ credentials/
 nexus-run-log.json
 downloads/
 credentials.json
+
+.env.backup

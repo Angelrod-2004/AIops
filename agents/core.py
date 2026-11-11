@@ -61,33 +61,36 @@ def build_llm(temperature: float | None = None):
     provider = config.LLM_PROVIDER
     model = config.model_name()
     temp = config.LLM_TEMPERATURE if temperature is None else temperature
+    max_tokens = config.LLM_MAX_TOKENS
 
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=model, temperature=temp, max_tokens=4096, timeout=120)
+        return ChatAnthropic(model=model, temperature=temp, max_tokens=max_tokens, timeout=180)
     if provider == "google":
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
         except ImportError as exc:
             raise RuntimeError("pip install langchain-google-genai to use Gemini") from exc
-        return ChatGoogleGenerativeAI(model=model, temperature=temp)
+        return ChatGoogleGenerativeAI(model=model, temperature=temp, max_output_tokens=max_tokens)
     if provider == "groq":
         try:
             from langchain_groq import ChatGroq
         except ImportError as exc:
             raise RuntimeError("pip install langchain-groq to use Groq") from exc
-        return ChatGroq(model=model, temperature=temp)
+        return ChatGroq(model=model, temperature=temp, max_tokens=max_tokens, timeout=180)
     if provider == "ollama":
         try:
             from langchain_ollama import ChatOllama
         except ImportError as exc:
             raise RuntimeError("pip install langchain-ollama to use a local model") from exc
-        return ChatOllama(model=model, temperature=temp)
+        return ChatOllama(model=model, temperature=temp, num_predict=max_tokens)
 
     from langchain_openai import ChatOpenAI
 
-    kwargs: dict[str, Any] = {"model": model, "temperature": temp, "timeout": 120}
+    kwargs: dict[str, Any] = {
+        "model": model, "temperature": temp, "timeout": 180, "max_tokens": max_tokens
+    }
     if config.OPENAI_API_KEY:
         kwargs["api_key"] = config.OPENAI_API_KEY
     if config.LLM_BASE_URL:
@@ -216,6 +219,17 @@ def execute_task(task: dict[str, Any], llm=None) -> dict[str, Any]:
         "steps": [],
         "started_at": time.strftime("%H:%M:%S"),
     }
+
+    # Defence in depth: a review-gated task must never reach a tool, even if a
+    # caller bypasses the Streamlit queue controls.
+    if task.get("approval_required") and not task.get("approved"):
+        return {
+            **base,
+            "status": "blocked",
+            "ms": 0,
+            "error": "Human approval is required before this task can execute.",
+            "output": {"ok": False, "blocked": True, "error": "Human approval required"},
+        }
 
     # Free-form job -> the app's agent decides which tools to call.
     if operation is None or task.get("operation_id") == "auto":

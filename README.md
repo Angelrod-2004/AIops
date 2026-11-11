@@ -4,8 +4,8 @@ A **multi-agent AI control surface** built with **LangGraph** + **Streamlit** th
 **Gmail**, **Google Calendar**, **Jira** and **WhatsApp** — 94 operations, one supervisor, four specialist agents.
 
 Pick an app → pick an operation → fill the fields → **Execute**. The graph fans the work out to the right
-specialist agent(s) *in parallel* and reports back with a full tool-call trace. Or skip the forms entirely and
-describe the outcome in plain English.
+specialist agent(s) *in parallel* and reports back with a full tool-call trace. You can also upload a task PDF:
+the planner extracts its Gmail, Calendar, Jira, and WhatsApp instructions into a reviewable execution queue.
 
 ```
                                    ┌──────────────────────────┐
@@ -55,14 +55,22 @@ tool name, exact arguments and raw API payload are all visible in the report.
 Presets queue a ready-made run in one click, including **“All four at once”**, which fires the Gmail, Calendar,
 Jira and WhatsApp agents simultaneously to demonstrate the parallel fan-out.
 
-### 2 · Agent Chat (LLM)
-Type what you want:
+### 2 · PDF task intake (LLM planner, approval gated)
+Upload a selectable-text PDF containing instructions that span a day, week, or month. The planner chunks long
+documents, maps each Gmail, Calendar, Jira, and WhatsApp instruction to the operation catalogue, and queues a
+proposed action for each one. It uses safe conventional defaults only when the intent is clear (for example,
+a one-hour meeting or three-hour webinar); uncertain recipients, timing, content, and destinations are flagged.
 
-> *“Find a free 30 minute slot with ada@example.com tomorrow afternoon, book it with a Meet link,
-> then WhatsApp her the invite.”*
+**The agent decides what needs a human.** A fully specified task is ready to run. A task is held for approval when
+the planner is unsure, and *always* when a required input is still blank — those are impossible to execute, so the
+approve button stays disabled until you fill them in.
 
-The supervisor turns that into tasks (validated against the operation catalogue), routes each one to its
-specialist, and the specialist may chain several tools to finish the job. Chat mode needs one LLM key in `.env`:
+In **Human approval**, each held task is shown with its real input fields (not raw JSON) plus the reason it was
+held and which part of the PDF it came from. Fix anything wrong, then **Approve task** — or **Remove task**.
+**Execute approved queue** runs only the approved ones and leaves everything else in the queue; nothing is
+silently dropped.
+
+PDF planning needs one LLM key in `.env`:
 
 ```ini
 LLM_PROVIDER=openai            # openai | anthropic | google | groq | ollama
@@ -96,12 +104,50 @@ JIRA_API_TOKEN=...          # https://id.atlassian.com/manage-profile/security/a
 JIRA_DEFAULT_PROJECT=OPS
 ```
 
-### WhatsApp Cloud API
+### WhatsApp Cloud API — switch from simulated to live
+1. In **Meta for Developers**, create/select an app with the **WhatsApp** product, connect a WhatsApp Business
+   Account and add a production phone number. Complete Meta business verification if your account requires it.
+2. Create a **system user** in Meta Business Settings, grant it access to the WhatsApp Business Account and phone
+   number, then create a long-lived/permanent access token with `whatsapp_business_messaging` (and
+   `whatsapp_business_management` when using profile/template tools).
+3. Put the values in `.env` and restart Streamlit:
+
 ```ini
-WHATSAPP_TOKEN=EAAG...              # permanent system-user token
-WHATSAPP_PHONE_NUMBER_ID=1234567890
-WHATSAPP_BUSINESS_ID=0987654321
+WHATSAPP_TOKEN=EAAG...              # permanent system-user token; never commit it
+WHATSAPP_PHONE_NUMBER_ID=1234567890 # Meta's phone-number ID, not the telephone number
+WHATSAPP_BUSINESS_ID=0987654321     # WhatsApp Business Account ID (optional for sending text)
+SIMULATE_MODE=auto                  # live when the token and phone-number ID are present
+# or: SIMULATE_MODE=never           # force live calls and show configuration/API errors
 ```
+
+4. Reload the app: the WhatsApp card/sidebar status must show **LIVE**. Send a test only to a recipient that has
+   opted in and is allowed by the current Meta app mode. Use digits with country code and no `+` (for example,
+   `919876543210`).
+5. Outside WhatsApp's 24-hour customer-service window, use an approved **template** rather than free-form text.
+   For production inbound messages and delivery callbacks, configure a public HTTPS webhook in Meta; this app only
+   sends outbound requests.
+
+Do not select **always** in the sidebar execution mode: it intentionally forces every integration to simulated
+mode. A real end-to-end WhatsApp send requires your own production token and opted-in test recipient, so it cannot
+be safely performed from this environment.
+
+**How to tell why WhatsApp is still simulated.** `configured("whatsapp")` needs *both* `WHATSAPP_TOKEN` and
+`WHATSAPP_PHONE_NUMBER_ID`. The phone-number ID is Meta's internal id, not the telephone number — fetch it with:
+
+```bash
+curl -s "https://graph.facebook.com/v21.0/<WHATSAPP_BUSINESS_ID>/phone_numbers?access_token=<TOKEN>"
+```
+
+Copy `data[0].id` into `WHATSAPP_PHONE_NUMBER_ID` and restart. Then confirm every integration without sending
+anything:
+
+```bash
+python scripts/live_check.py     # read-only calls against Gmail, Calendar, Jira and WhatsApp
+```
+
+Common send errors: `131047` = outside the 24-hour window (use a template); `401`/code `190` = token invalid or
+expired; `400`/code `100` on profile calls = the phone-number ID was empty, which `wa_phone_id()` now reports
+explicitly instead of forwarding a confusing Graph error.
 
 ### WhatsApp contacts
 The WhatsApp operations have a **Saved WhatsApp contacts** panel above the form (search, Use, Edit, save new).
@@ -143,7 +189,7 @@ Dates accept **natural language** everywhere: `tomorrow 3pm`, `next monday 09:30
 ## Project layout
 
 ```
-app.py                  Streamlit front-end (Command Deck, Agent Chat, Run Log, How it works)
+app.py                  Streamlit front-end (Command Deck, PDF intake, Run Log, How it works)
 config.py               env loading, per-app connection status, simulate/live resolution
 operations.py           the operation catalogue — drives every form field in the UI
 agents/core.py          LLM factory, deterministic tool runner, tool-calling loop, task executor
@@ -160,7 +206,7 @@ scripts/                google_auth.py · check_catalog.py · selftest.py · smo
 
 ### Why the operation catalogue matters
 `operations.py` is the single source of truth: one `Operation` = one `@tool` + typed `Field`s. The UI builds its
-forms, validation and run queue entirely from it, and the chat planner is validated against it. Adding an
+forms, validation and run queue entirely from it, and the PDF planner is validated against it. Adding an
 operation is a two-step change:
 
 1. Write a `@tool` in the matching `tools/*_tools.py` (and add it to that module's `*_TOOLS` list).
@@ -175,13 +221,18 @@ Then run `python scripts/check_catalog.py` — it fails loudly if the catalogue 
 ```bash
 python scripts/check_catalog.py        # 94 operations ↔ 94 tools, signatures aligned
 python scripts/audit_fields.py         # no tool parameter is left unsurfaced in the UI
-python scripts/selftest.py             # 32 pure-logic checks (dates, payloads, planner validation)
-python scripts/smoke_test.py           # runs the real LangGraph fan-out with 5 tasks, incl. a validation failure
-python scripts/ui_test.py              # AppTest: presets, execution, form submit, contact "Use" prefill
-python scripts/field_coverage_test.py  # every catalog field renders a widget (walks all 94 operations)
+python scripts/selftest.py             # 43 pure-logic checks (dates, payloads, JSON salvage, planner)
+python scripts/smoke_test.py           # LangGraph fan-out, 5 tasks incl. a validation failure
+python scripts/ui_test.py              # AppTest: presets, execute, form submit, approval gate, Use prefill
+python scripts/field_coverage_test.py  # every field renders (all 94 operations, 250 fields + 15 hidden)
+python scripts/pdf_approval_test.py    # PDF extraction + the backend approval guard
+python scripts/make_test_pdf.py        # generates test_plan.pdf (5 pages of mixed instructions)
+python scripts/pdf_e2e_test.py         # PDF -> planner -> review-gated tasks (uses the real LLM)
+python scripts/live_check.py           # read-only calls against the live Gmail/Calendar/Jira/WhatsApp APIs
 ```
 
-All test scripts force **simulated** mode, so running them never sends mail, creates events or messages anyone.
+All unit/UI test scripts force **simulated** mode, so running them never sends mail, creates events or messages
+anyone. `live_check.py` is the one exception — it deliberately goes live, but every call it makes is read-only.
 
 ---
 
